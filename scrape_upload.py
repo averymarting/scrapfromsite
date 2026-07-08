@@ -52,7 +52,7 @@ DOWNLOAD_DIR = Path("downloaded_images")
 
 # Default target sheet (from the link you shared). Can be overridden with
 # the SPREADSHEET_ID env var / --spreadsheet-id flag.
-DEFAULT_SPREADSHEET_ID = "1OQns3xUPeTQslsw0FaD-a85DAM0Sc_L6BnaGDMqGPmY"
+DEFAULT_SPREADSHEET_ID = "1iytww-yyDcgSuqyuM64BczX7zJXM--_V9Qe2QpJrJeE"
 DEFAULT_SHEET_TAB = "Sheet1"
 
 
@@ -319,26 +319,21 @@ def log_to_sheet(spreadsheet_id: str, sheet_tab: str, page_url: str,
     if not upload_results:
         return
 
-    log(f"Writing {len(upload_results)} rows to Google Sheet ({sheet_tab})...")
+    log(f"Writing {len(upload_results)} file name(s) to Google Sheet ({sheet_tab})...")
     creds = get_user_credentials()
     sheets = build("sheets", "v4", credentials=creds)
 
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rows = [
-        [now, page_url, folder_name, r["file_name"], r["source_url"],
-         r["drive_file_id"], r["drive_link"]]
-        for r in upload_results
-    ]
+    rows = [[r["file_name"]] for r in upload_results]
 
     try:
         sheets.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
-            range=f"{sheet_tab}!A:G",
+            range=f"{sheet_tab}!A:A",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values": rows},
         ).execute()
-        log(f"Sheet updated: {len(rows)} rows appended to '{sheet_tab}'.")
+        log(f"Sheet updated: {len(rows)} file name(s) appended to '{sheet_tab}'.")
     except Exception as e:
         log(f"! Failed to write to Google Sheet: {e}")
         log("  (Make sure the sheet is shared with the service account's email as an Editor,"
