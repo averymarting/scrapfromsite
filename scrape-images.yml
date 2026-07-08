@@ -1,0 +1,59 @@
+name: Scrape item-post images and upload to Google Drive
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_url:
+        description: "Page URL to scrape (.item-post img elements)"
+        required: true
+        type: string
+      drive_folder_name:
+        description: "Google Drive folder name to save images into"
+        required: true
+        type: string
+      max_idle_scrolls:
+        description: "Stop after this many scrolls with no new images"
+        required: false
+        default: "8"
+        type: string
+      parent_folder_id:
+        description: "(optional) Drive parent folder ID to create the folder inside"
+        required: false
+        type: string
+
+jobs:
+  scrape-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: playwright install --with-deps chromium
+
+      - name: Run scraper + Drive uploader
+        env:
+          PAGE_URL: ${{ inputs.page_url }}
+          DRIVE_FOLDER_NAME: ${{ inputs.drive_folder_name }}
+          MAX_IDLE_SCROLLS: ${{ inputs.max_idle_scrolls }}
+          GDRIVE_PARENT_ID: ${{ inputs.parent_folder_id }}
+          GDRIVE_SA_KEY_JSON: ${{ secrets.GDRIVE_SA_KEY_JSON }}
+        run: python scrape_upload.py
+
+      - name: Upload run log as artifact (optional debug aid)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: downloaded-images
+          path: downloaded_images/
+          if-no-files-found: ignore
