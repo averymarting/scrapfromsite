@@ -28,7 +28,7 @@ on:
       spreadsheet_id:
         description: "(optional) Google Sheet ID to log file names into"
         required: false
-        default: "1iytww-yyDcgSuqyuM64BczX7zJXM--_V9Qe2QpJrJeE"
+        default: "1OQns3xUPeTQslsw0FaD-a85DAM0Sc_L6BnaGDMqGPmY"
         type: string
       sheet_tab:
         description: "Tab name inside the sheet to append rows to"
@@ -65,7 +65,7 @@ jobs:
           GDRIVE_PARENT_ID: ${{ inputs.parent_folder_id }}
           SPREADSHEET_ID: ${{ inputs.spreadsheet_id }}
           SHEET_TAB: ${{ inputs.sheet_tab }}
-          GDRIVE_SA_KEY_JSON: ${{ secrets.GDRIVE_SA_KEY_JSON }}
+          GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
           PYTHONUNBUFFERED: "1"
         run: python -u scrape_upload.py
 
