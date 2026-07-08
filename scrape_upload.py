@@ -14,7 +14,9 @@ Usage:
 Env vars (used by the GitHub Actions workflow, but work locally too):
     PAGE_URL           -> same as --url
     DRIVE_FOLDER_NAME  -> same as --folder-name
-    GDRIVE_SA_KEY_JSON -> raw JSON content of a Google service account key
+    GDRIVE_CREDENTIALS_JSON -> combined OAuth credentials JSON (token, refresh_token,
+                               client_id, client_secret, etc.) generated once via
+                               generate_refresh_token.py
     GDRIVE_PARENT_ID   -> (optional) Drive folder ID to create the new folder under
                           (must be a folder already shared with the service account,
                           or a Shared Drive folder)
@@ -36,7 +38,8 @@ from urllib.parse import urlparse
 import requests
 from playwright.sync_api import sync_playwright
 
-from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
@@ -216,13 +219,36 @@ def download_images(urls: set) -> list:
     return saved_paths
 
 
-def get_drive_service():
-    key_json = os.environ.get("GDRIVE_SA_KEY_JSON")
-    if not key_json:
-        sys.exit("ERROR: GDRIVE_SA_KEY_JSON env var not set (service account key JSON)")
+def get_user_credentials() -> UserCredentials:
+    raw = os.environ.get("GDRIVE_CREDENTIALS_JSON")
+    if not raw:
+        sys.exit("ERROR: GDRIVE_CREDENTIALS_JSON env var not set. "
+                  "Run generate_refresh_token.py once locally to obtain it.")
 
-    info = json.loads(key_json)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as e:
+        sys.exit(f"ERROR: GDRIVE_CREDENTIALS_JSON is not valid JSON: {e}")
+
+    required = ["refresh_token", "client_id", "client_secret"]
+    missing = [k for k in required if not info.get(k)]
+    if missing:
+        sys.exit(f"ERROR: GDRIVE_CREDENTIALS_JSON is missing field(s): {', '.join(missing)}")
+
+    creds = UserCredentials(
+        info.get("token"),
+        refresh_token=info["refresh_token"],
+        token_uri=info.get("token_uri", "https://oauth2.googleapis.com/token"),
+        client_id=info["client_id"],
+        client_secret=info["client_secret"],
+        scopes=info.get("scopes", SCOPES),
+    )
+    creds.refresh(Request())
+    return creds
+
+
+def get_drive_service():
+    creds = get_user_credentials()
     return build("drive", "v3", credentials=creds)
 
 
@@ -294,8 +320,7 @@ def log_to_sheet(spreadsheet_id: str, sheet_tab: str, page_url: str,
         return
 
     log(f"Writing {len(upload_results)} rows to Google Sheet ({sheet_tab})...")
-    creds_info = json.loads(os.environ["GDRIVE_SA_KEY_JSON"])
-    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    creds = get_user_credentials()
     sheets = build("sheets", "v4", credentials=creds)
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
