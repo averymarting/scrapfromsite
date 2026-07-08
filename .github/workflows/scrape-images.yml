@@ -16,9 +16,24 @@ on:
         required: false
         default: "8"
         type: string
+      max_images:
+        description: "Optional: max number of images to scrape (leave blank to scrape until 8 idle scrolls)"
+        required: false
+        default: ""
+        type: string
       parent_folder_id:
         description: "(optional) Drive parent folder ID to create the folder inside"
         required: false
+        type: string
+      spreadsheet_id:
+        description: "(optional) Google Sheet ID to log file names into"
+        required: false
+        default: "1iytww-yyDcgSuqyuM64BczX7zJXM--_V9Qe2QpJrJeE"
+        type: string
+      sheet_tab:
+        description: "Tab name inside the sheet to append rows to"
+        required: false
+        default: "Sheet1"
         type: string
 
 jobs:
@@ -46,9 +61,13 @@ jobs:
           PAGE_URL: ${{ inputs.page_url }}
           DRIVE_FOLDER_NAME: ${{ inputs.drive_folder_name }}
           MAX_IDLE_SCROLLS: ${{ inputs.max_idle_scrolls }}
+          MAX_IMAGES: ${{ inputs.max_images }}
           GDRIVE_PARENT_ID: ${{ inputs.parent_folder_id }}
+          SPREADSHEET_ID: ${{ inputs.spreadsheet_id }}
+          SHEET_TAB: ${{ inputs.sheet_tab }}
           GDRIVE_SA_KEY_JSON: ${{ secrets.GDRIVE_SA_KEY_JSON }}
-        run: python scrape_upload.py
+          PYTHONUNBUFFERED: "1"
+        run: python -u scrape_upload.py
 
       - name: Upload run log as artifact (optional debug aid)
         if: always()
