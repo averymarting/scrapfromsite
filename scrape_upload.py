@@ -29,6 +29,7 @@ import sys
 import time
 import hashlib
 import json
+import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -39,9 +40,24 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-SCOPES = ["https://www.googleapis.com/auth/drive"]
+SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets",
+]
 ITEM_SELECTOR = ".item-post img"
 DOWNLOAD_DIR = Path("downloaded_images")
+
+# Default target sheet (from the link you shared). Can be overridden with
+# the SPREADSHEET_ID env var / --spreadsheet-id flag.
+DEFAULT_SPREADSHEET_ID = "1iytww-yyDcgSuqyuM64BczX7zJXM--_V9Qe2QpJrJeE"
+DEFAULT_SHEET_TAB = "Sheet1"
+
+
+def log(msg: str):
+    """Print immediately, unbuffered, with a timestamp — so GitHub Actions
+    logs show live progress instead of appearing stuck."""
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
 
 
 def parse_args():
@@ -52,8 +68,16 @@ def parse_args():
     p.add_argument("--max-idle-scrolls", type=int,
                    default=int(os.environ.get("MAX_IDLE_SCROLLS", "8")),
                    help="Stop after this many consecutive scrolls with no new images (default: 8)")
+    p.add_argument("--max-images", type=int,
+                   default=(int(os.environ["MAX_IMAGES"]) if os.environ.get("MAX_IMAGES") else None),
+                   help="Optional cap on total images to scrape/download/upload. "
+                        "Leave unset to scrape until 8 idle scrolls instead.")
     p.add_argument("--parent-id", default=os.environ.get("GDRIVE_PARENT_ID"),
                    help="Optional Drive parent folder ID to create the new folder inside")
+    p.add_argument("--spreadsheet-id", default=os.environ.get("SPREADSHEET_ID", DEFAULT_SPREADSHEET_ID),
+                   help="Google Sheet ID to log uploaded file names into")
+    p.add_argument("--sheet-tab", default=os.environ.get("SHEET_TAB", DEFAULT_SHEET_TAB),
+                   help="Tab/sheet name inside the spreadsheet to append rows to")
     p.add_argument("--headless", action="store_true", default=True)
     args = p.parse_args()
 
@@ -69,13 +93,23 @@ def is_jpg(url: str) -> bool:
     return path.endswith(".jpg") or path.endswith(".jpeg")
 
 
-def scrape_images(url: str, max_idle_scrolls: int) -> set:
+def scrape_images(url: str, max_idle_scrolls: int, max_images: int | None = None) -> set:
     """Scroll the page repeatedly, collecting unique .item-post img src values
-    that point to .jpg/.jpeg files, until max_idle_scrolls consecutive scrolls
-    produce no new images."""
+    that point to .jpg/.jpeg files.
+
+    Stops when either:
+      - max_images is set and that many unique images have been found, or
+      - max_idle_scrolls consecutive scrolls produce no new images.
+    """
     found = set()
     idle_scrolls = 0
     scroll_count = 0
+
+    log(f"Launching browser and opening: {url}")
+    if max_images:
+        log(f"Image limit set: will stop as soon as {max_images} images are found.")
+    else:
+        log(f"No image limit set: will scrape until {max_idle_scrolls} consecutive idle scrolls.")
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -86,6 +120,7 @@ def scrape_images(url: str, max_idle_scrolls: int) -> set:
             )
         )
         page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        log("Page loaded. Waiting for initial images to render...")
 
         # Give the initial batch of lazy images a moment to appear
         page.wait_for_timeout(2000)
@@ -100,9 +135,15 @@ def scrape_images(url: str, max_idle_scrolls: int) -> set:
                 if src and is_jpg(src) and src not in found:
                     found.add(src)
                     new_this_round += 1
+                    if max_images and len(found) >= max_images:
+                        break
 
-            print(f"[scroll {scroll_count}] total unique jpgs so far: {len(found)} "
-                  f"(+{new_this_round} this round, idle streak: {idle_scrolls})")
+            log(f"Scroll #{scroll_count}: {len(found)} unique jpgs found so far "
+                f"(+{new_this_round} new this round, idle streak: {idle_scrolls}/{max_idle_scrolls})")
+
+            if max_images and len(found) >= max_images:
+                log(f"Reached the requested limit of {max_images} images. Stopping scroll loop.")
+                break
 
             if new_this_round == 0:
                 idle_scrolls += 1
@@ -110,20 +151,26 @@ def scrape_images(url: str, max_idle_scrolls: int) -> set:
                 idle_scrolls = 0
 
             if idle_scrolls >= max_idle_scrolls:
-                print(f"No new images found for {max_idle_scrolls} consecutive scrolls. Stopping.")
+                log(f"No new images for {max_idle_scrolls} consecutive scrolls. Stopping scroll loop.")
                 break
 
             # Scroll to bottom to trigger lazy-load / infinite scroll
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             scroll_count += 1
+            log(f"Scrolled to bottom (scroll #{scroll_count}), waiting for new content to load...")
             # Wait for network to settle a bit, then a fixed pause for lazy images
             try:
                 page.wait_for_load_state("networkidle", timeout=5000)
             except Exception:
-                pass
+                log("  (network still busy after 5s, continuing anyway)")
             page.wait_for_timeout(1500)
 
         browser.close()
+        log("Browser closed.")
+
+    # Trim to the exact limit in case the last batch overshot it
+    if max_images and len(found) > max_images:
+        found = set(list(found)[:max_images])
 
     return found
 
@@ -132,28 +179,40 @@ def download_images(urls: set) -> list:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     saved_paths = []
     headers = {"User-Agent": "Mozilla/5.0"}
+    urls = sorted(urls)
+    total = len(urls)
+    used_names = set()
 
-    for src in urls:
+    log(f"Starting download of {total} images...")
+    for i, src in enumerate(urls, start=1):
         try:
             resp = requests.get(src, headers=headers, timeout=30, stream=True)
             resp.raise_for_status()
         except Exception as e:
-            print(f"  ! failed to download {src}: {e}")
+            log(f"  [{i}/{total}] FAILED to download {src}: {e}")
             continue
 
-        # Derive a stable filename from the URL (falls back to a hash)
+        # Keep the website's own filename (default behavior). Only fall back
+        # to a hash-based name if the URL has no usable filename.
         name = os.path.basename(urlparse(src).path)
         if not name.lower().endswith((".jpg", ".jpeg")):
             name = hashlib.sha1(src.encode()).hexdigest() + ".jpg"
+
+        # Avoid overwriting if two different posts happen to share a filename
+        if name in used_names:
+            stem, ext = os.path.splitext(name)
+            name = f"{stem}_{hashlib.sha1(src.encode()).hexdigest()[:6]}{ext}"
+        used_names.add(name)
 
         dest = DOWNLOAD_DIR / name
         with open(dest, "wb") as f:
             for chunk in resp.iter_content(8192):
                 f.write(chunk)
 
-        saved_paths.append(dest)
-        print(f"  saved {dest}")
+        saved_paths.append((dest, src))
+        log(f"  [{i}/{total}] saved: {name}")
 
+    log(f"Download finished: {len(saved_paths)}/{total} images saved successfully.")
     return saved_paths
 
 
@@ -198,41 +257,100 @@ def find_or_create_folder(service, folder_name: str, parent_id: str | None) -> s
     return folder_id
 
 
-def upload_to_drive(service, folder_id: str, paths: list):
-    for path in paths:
+def upload_to_drive(service, folder_id: str, saved_paths: list) -> list:
+    """Uploads each (path, source_url) pair to Drive. Returns a list of dicts
+    with everything needed for the sheet log."""
+    total = len(saved_paths)
+    results = []
+    log(f"Starting upload of {total} images to Drive folder id {folder_id}...")
+
+    for i, (path, source_url) in enumerate(saved_paths, start=1):
         metadata = {"name": path.name, "parents": [folder_id]}
         media = MediaFileUpload(str(path), mimetype="image/jpeg", resumable=True)
         uploaded = service.files().create(
-            body=metadata, media_body=media, fields="id", supportsAllDrives=True
+            body=metadata, media_body=media, fields="id, webViewLink",
+            supportsAllDrives=True,
         ).execute()
-        print(f"  uploaded {path.name} -> Drive file id {uploaded['id']}")
+        file_id = uploaded["id"]
+        link = uploaded.get("webViewLink", f"https://drive.google.com/file/d/{file_id}/view")
+        log(f"  [{i}/{total}] uploaded: {path.name} -> {link}")
+        results.append({
+            "file_name": path.name,
+            "source_url": source_url,
+            "drive_file_id": file_id,
+            "drive_link": link,
+        })
+
+    log(f"Upload finished: {len(results)}/{total} images uploaded successfully.")
+    return results
+
+
+def log_to_sheet(spreadsheet_id: str, sheet_tab: str, page_url: str,
+                  folder_name: str, upload_results: list):
+    if not spreadsheet_id:
+        log("No spreadsheet ID configured — skipping sheet logging.")
+        return
+    if not upload_results:
+        return
+
+    log(f"Writing {len(upload_results)} rows to Google Sheet ({sheet_tab})...")
+    creds_info = json.loads(os.environ["GDRIVE_SA_KEY_JSON"])
+    creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    sheets = build("sheets", "v4", credentials=creds)
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = [
+        [now, page_url, folder_name, r["file_name"], r["source_url"],
+         r["drive_file_id"], r["drive_link"]]
+        for r in upload_results
+    ]
+
+    try:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{sheet_tab}!A:G",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()
+        log(f"Sheet updated: {len(rows)} rows appended to '{sheet_tab}'.")
+    except Exception as e:
+        log(f"! Failed to write to Google Sheet: {e}")
+        log("  (Make sure the sheet is shared with the service account's email as an Editor,"
+            " and that the tab name matches --sheet-tab.)")
 
 
 def main():
     args = parse_args()
 
-    print(f"Scraping: {args.url}")
-    print(f"Stop condition: {args.max_idle_scrolls} consecutive idle scrolls")
-    image_urls = scrape_images(args.url, args.max_idle_scrolls)
-    print(f"\nTotal unique .jpg images found: {len(image_urls)}")
+    log(f"=== Starting run ===")
+    log(f"Page URL: {args.url}")
+    log(f"Drive folder name: {args.folder_name}")
+    if args.max_images:
+        log(f"Image limit: {args.max_images}")
+    else:
+        log(f"Image limit: none (stop condition = {args.max_idle_scrolls} consecutive idle scrolls)")
+
+    image_urls = scrape_images(args.url, args.max_idle_scrolls, args.max_images)
+    log(f"=== Scrape complete: {len(image_urls)} unique .jpg images found ===")
 
     if not image_urls:
-        print("No images found — nothing to upload.")
+        log("No images found — nothing to download or upload.")
         return
 
-    print("\nDownloading images...")
     saved_paths = download_images(image_urls)
 
     if not saved_paths:
-        print("No images were successfully downloaded — nothing to upload.")
+        log("No images were successfully downloaded — nothing to upload.")
         return
 
-    print(f"\nUploading {len(saved_paths)} images to Google Drive folder '{args.folder_name}'...")
     service = get_drive_service()
     folder_id = find_or_create_folder(service, args.folder_name, args.parent_id)
-    upload_to_drive(service, folder_id, saved_paths)
+    upload_results = upload_to_drive(service, folder_id, saved_paths)
 
-    print("\nDone.")
+    log_to_sheet(args.spreadsheet_id, args.sheet_tab, args.url, args.folder_name, upload_results)
+
+    log("=== Done ===")
 
 
 if __name__ == "__main__":
