@@ -28,12 +28,22 @@ on:
       spreadsheet_id:
         description: "(optional) Google Sheet ID to log file names into"
         required: false
-        default: "1OQns3xUPeTQslsw0FaD-a85DAM0Sc_L6BnaGDMqGPmY"
+        default: "1iytww-yyDcgSuqyuM64BczX7zJXM--_V9Qe2QpJrJeE"
         type: string
       sheet_tab:
         description: "Tab name inside the sheet to append rows to"
         required: false
         default: "Sheet1"
+        type: string
+      download_concurrency:
+        description: "How many images to download in parallel"
+        required: false
+        default: "10"
+        type: string
+      upload_concurrency:
+        description: "How many images to upload to Drive in parallel"
+        required: false
+        default: "8"
         type: string
 
 jobs:
@@ -65,6 +75,8 @@ jobs:
           GDRIVE_PARENT_ID: ${{ inputs.parent_folder_id }}
           SPREADSHEET_ID: ${{ inputs.spreadsheet_id }}
           SHEET_TAB: ${{ inputs.sheet_tab }}
+          DOWNLOAD_CONCURRENCY: ${{ inputs.download_concurrency }}
+          UPLOAD_CONCURRENCY: ${{ inputs.upload_concurrency }}
           GDRIVE_CREDENTIALS_JSON: ${{ secrets.GDRIVE_CREDENTIALS_JSON }}
           PYTHONUNBUFFERED: "1"
         run: python -u scrape_upload.py
