@@ -18,8 +18,7 @@ Env vars (used by the GitHub Actions workflow, but work locally too):
                                client_id, client_secret, etc.) generated once via
                                generate_refresh_token.py
     GDRIVE_PARENT_ID   -> (optional) Drive folder ID to create the new folder under
-                          (must be a folder already shared with the service account,
-                          or a Shared Drive folder)
+                          (any folder in your own Drive, since auth is your own OAuth account)
     MAX_IDLE_SCROLLS   -> (optional) override the default of 8
 """
 
@@ -32,6 +31,8 @@ import time
 import hashlib
 import json
 import datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -81,6 +82,12 @@ def parse_args():
                    help="Google Sheet ID to log uploaded file names into")
     p.add_argument("--sheet-tab", default=os.environ.get("SHEET_TAB", DEFAULT_SHEET_TAB),
                    help="Tab/sheet name inside the spreadsheet to append rows to")
+    p.add_argument("--download-concurrency", type=int,
+                   default=int(os.environ.get("DOWNLOAD_CONCURRENCY", "10")),
+                   help="How many images to download in parallel (default: 10)")
+    p.add_argument("--upload-concurrency", type=int,
+                   default=int(os.environ.get("UPLOAD_CONCURRENCY", "8")),
+                   help="How many images to upload to Drive in parallel (default: 8)")
     p.add_argument("--headless", action="store_true", default=True)
     args = p.parse_args()
 
@@ -178,42 +185,72 @@ def scrape_images(url: str, max_idle_scrolls: int, max_images: int | None = None
     return found
 
 
-def download_images(urls: set) -> list:
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    saved_paths = []
-    headers = {"User-Agent": "Mozilla/5.0"}
-    urls = sorted(urls)
-    total = len(urls)
-    used_names = set()
+_progress_lock = threading.Lock()
 
-    log(f"Starting download of {total} images...")
-    for i, src in enumerate(urls, start=1):
+
+def _download_one(src: str, headers: dict, used_names: set, names_lock: threading.Lock,
+                   max_retries: int = 3):
+    last_err = None
+    for attempt in range(1, max_retries + 1):
         try:
             resp = requests.get(src, headers=headers, timeout=30, stream=True)
             resp.raise_for_status()
+            break
         except Exception as e:
-            log(f"  [{i}/{total}] FAILED to download {src}: {e}")
-            continue
+            last_err = e
+            if attempt < max_retries:
+                time.sleep(1.5 * attempt)  # small backoff before retrying
+            else:
+                raise last_err
 
-        # Keep the website's own filename (default behavior). Only fall back
-        # to a hash-based name if the URL has no usable filename.
-        name = os.path.basename(urlparse(src).path)
-        if not name.lower().endswith((".jpg", ".jpeg")):
-            name = hashlib.sha1(src.encode()).hexdigest() + ".jpg"
+    # Keep the website's own filename (default behavior). Only fall back
+    # to a hash-based name if the URL has no usable filename.
+    name = os.path.basename(urlparse(src).path)
+    if not name.lower().endswith((".jpg", ".jpeg")):
+        name = hashlib.sha1(src.encode()).hexdigest() + ".jpg"
 
-        # Avoid overwriting if two different posts happen to share a filename
+    # Avoid overwriting if two different posts happen to share a filename
+    with names_lock:
         if name in used_names:
             stem, ext = os.path.splitext(name)
             name = f"{stem}_{hashlib.sha1(src.encode()).hexdigest()[:6]}{ext}"
         used_names.add(name)
 
-        dest = DOWNLOAD_DIR / name
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(8192):
-                f.write(chunk)
+    dest = DOWNLOAD_DIR / name
+    with open(dest, "wb") as f:
+        for chunk in resp.iter_content(8192):
+            f.write(chunk)
 
-        saved_paths.append((dest, src))
-        log(f"  [{i}/{total}] saved: {name}")
+    return dest, src
+
+
+def download_images(urls: set, concurrency: int = 10) -> list:
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    urls = sorted(urls)
+    total = len(urls)
+    used_names = set()
+    names_lock = threading.Lock()
+    saved_paths = []
+    completed = 0
+
+    log(f"Starting parallel download of {total} images ({concurrency} at a time)...")
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        future_to_src = {
+            executor.submit(_download_one, src, headers, used_names, names_lock): src
+            for src in urls
+        }
+        for future in as_completed(future_to_src):
+            src = future_to_src[future]
+            with _progress_lock:
+                completed += 1
+                current = completed
+            try:
+                dest, source_url = future.result()
+                saved_paths.append((dest, source_url))
+                log(f"  [{current}/{total}] saved: {dest.name}")
+            except Exception as e:
+                log(f"  [{current}/{total}] FAILED to download {src}: {e}")
 
     log(f"Download finished: {len(saved_paths)}/{total} images saved successfully.")
     return saved_paths
@@ -249,7 +286,18 @@ def get_user_credentials() -> UserCredentials:
 
 def get_drive_service():
     creds = get_user_credentials()
-    return build("drive", "v3", credentials=creds)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+_thread_local = threading.local()
+
+
+def _get_thread_drive_service(creds: UserCredentials):
+    """Each worker thread gets its own Drive service instance — googleapiclient
+    service objects aren't safe to share across threads."""
+    if not hasattr(_thread_local, "service"):
+        _thread_local.service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    return _thread_local.service
 
 
 def find_or_create_folder(service, folder_name: str, parent_id: str | None) -> str:
@@ -283,29 +331,61 @@ def find_or_create_folder(service, folder_name: str, parent_id: str | None) -> s
     return folder_id
 
 
-def upload_to_drive(service, folder_id: str, saved_paths: list) -> list:
-    """Uploads each (path, source_url) pair to Drive. Returns a list of dicts
-    with everything needed for the sheet log."""
+def _upload_one(creds: UserCredentials, folder_id: str, path: Path, source_url: str,
+                 max_retries: int = 3) -> dict:
+    service = _get_thread_drive_service(creds)
+    metadata = {"name": path.name, "parents": [folder_id]}
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            media = MediaFileUpload(str(path), mimetype="image/jpeg", resumable=True)
+            uploaded = service.files().create(
+                body=metadata, media_body=media, fields="id, webViewLink",
+                supportsAllDrives=True,
+            ).execute()
+            file_id = uploaded["id"]
+            link = uploaded.get("webViewLink", f"https://drive.google.com/file/d/{file_id}/view")
+            return {
+                "file_name": path.name,
+                "source_url": source_url,
+                "drive_file_id": file_id,
+                "drive_link": link,
+            }
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                time.sleep(1.5 * attempt)  # backoff, helps with transient rate-limit errors
+            else:
+                raise last_err
+
+
+def upload_to_drive(creds: UserCredentials, folder_id: str, saved_paths: list,
+                     concurrency: int = 8) -> list:
+    """Uploads each (path, source_url) pair to Drive in parallel. Returns a
+    list of dicts with everything needed for the sheet log."""
     total = len(saved_paths)
     results = []
-    log(f"Starting upload of {total} images to Drive folder id {folder_id}...")
+    completed = 0
+    log(f"Starting parallel upload of {total} images to Drive folder id {folder_id} "
+        f"({concurrency} at a time)...")
 
-    for i, (path, source_url) in enumerate(saved_paths, start=1):
-        metadata = {"name": path.name, "parents": [folder_id]}
-        media = MediaFileUpload(str(path), mimetype="image/jpeg", resumable=True)
-        uploaded = service.files().create(
-            body=metadata, media_body=media, fields="id, webViewLink",
-            supportsAllDrives=True,
-        ).execute()
-        file_id = uploaded["id"]
-        link = uploaded.get("webViewLink", f"https://drive.google.com/file/d/{file_id}/view")
-        log(f"  [{i}/{total}] uploaded: {path.name} -> {link}")
-        results.append({
-            "file_name": path.name,
-            "source_url": source_url,
-            "drive_file_id": file_id,
-            "drive_link": link,
-        })
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        future_to_item = {
+            executor.submit(_upload_one, creds, folder_id, path, source_url): (path, source_url)
+            for path, source_url in saved_paths
+        }
+        for future in as_completed(future_to_item):
+            path, source_url = future_to_item[future]
+            with _progress_lock:
+                completed += 1
+                current = completed
+            try:
+                result = future.result()
+                results.append(result)
+                log(f"  [{current}/{total}] uploaded: {result['file_name']} -> {result['drive_link']}")
+            except Exception as e:
+                log(f"  [{current}/{total}] FAILED to upload {path.name}: {e}")
 
     log(f"Upload finished: {len(results)}/{total} images uploaded successfully.")
     return results
@@ -336,8 +416,8 @@ def log_to_sheet(spreadsheet_id: str, sheet_tab: str, page_url: str,
         log(f"Sheet updated: {len(rows)} file name(s) appended to '{sheet_tab}'.")
     except Exception as e:
         log(f"! Failed to write to Google Sheet: {e}")
-        log("  (Make sure the sheet is shared with the service account's email as an Editor,"
-            " and that the tab name matches --sheet-tab.)")
+        log("  (Make sure the spreadsheet ID and tab name are correct, and that it's "
+            "accessible to the Google account used to generate GDRIVE_CREDENTIALS_JSON.)")
 
 
 def main():
@@ -358,15 +438,16 @@ def main():
         log("No images found — nothing to download or upload.")
         return
 
-    saved_paths = download_images(image_urls)
+    saved_paths = download_images(image_urls, concurrency=args.download_concurrency)
 
     if not saved_paths:
         log("No images were successfully downloaded — nothing to upload.")
         return
 
-    service = get_drive_service()
+    creds = get_user_credentials()
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
     folder_id = find_or_create_folder(service, args.folder_name, args.parent_id)
-    upload_results = upload_to_drive(service, folder_id, saved_paths)
+    upload_results = upload_to_drive(creds, folder_id, saved_paths, concurrency=args.upload_concurrency)
 
     log_to_sheet(args.spreadsheet_id, args.sheet_tab, args.url, args.folder_name, upload_results)
 
