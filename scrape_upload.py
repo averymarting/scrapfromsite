@@ -53,7 +53,7 @@ DOWNLOAD_DIR = Path("downloaded_images")
 
 # Default target sheet (from the link you shared). Can be overridden with
 # the SPREADSHEET_ID env var / --spreadsheet-id flag.
-DEFAULT_SPREADSHEET_ID = "1iytww-yyDcgSuqyuM64BczX7zJXM--_V9Qe2QpJrJeE"
+DEFAULT_SPREADSHEET_ID = "1OQns3xUPeTQslsw0FaD-a85DAM0Sc_L6BnaGDMqGPmY"
 DEFAULT_SHEET_TAB = "Sheet1"
 
 
